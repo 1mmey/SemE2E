@@ -1,163 +1,154 @@
 # Semantic E2E-VGuard
 
-This directory is a standalone refactor for the CISCN project. It keeps the E2E-VGuard timbre and psychoacoustic protection pipeline, and replaces the original ASR-targeted `Lasr` objective with the T-SemAttack semantic-tokenizer objective `Lsem`.
+This repository combines E2E-VGuard timbre protection with the T-SemAttack
+semantic objective. The project-owned Python code is split into reusable logic
+under `core/` and executable workflows under `scripts/`.
 
 ## Layout
 
-The submission-facing code is the top-level Python files in this directory:
-
-- `protect_semantic.py`: CLI entrypoint for generating protected audio.
-- `semantic_vguard.py`: optimization loop and E2E timbre branches.
-- `semantic_encoders.py`: semantic `Lsem` ensemble, using S3 tokenizer, HuBERT, Whisper, and MFCC.
-- `evaluate_asr.py`: ASR threat-model evaluation CLI.
-- `evaluate_tts.py`: TTS downstream evaluation CLI.
-- `evaluate_downstream.py`: compatibility wrapper for older ASR/TTS commands.
-- `asr_backends.py`, `speaker_similarity.py`, `audio_utils.py`, `text_metrics.py`, `io_utils.py`, `runtime.py`: reusable evaluation/runtime utilities.
-- `fetch_libritts_subset.py`, `run_semantic_batch.py`, `generate_tts_xtts.py`: dataset, batch protection, and XTTS pipeline helpers.
-
-Unused T-SemAttack migration artifacts such as ROSETok/DAC code are intentionally
-not included. The current semantic loss uses the mature `s3tokenizer` package and
-the CosyVoice tokenizer checkpoint instead of maintaining a local ROSETok copy.
-
-## Run
-
-```bash
-python protect_semantic.py --input_wav path/to/input.wav --epochs 500 --timbre_mode untargeted
-```
-
-The default output is `*_semantic.wav` next to the input file.
-
-## Objective
-
 ```text
-L = weight_feature * Lfea + weight_semantic * Lsem + weight_psy * Lpsy + weight_l2 * L2
+core/
+  guard.py          optimization loop and timbre/quality objectives
+  encoders.py       S3, HuBERT, Whisper, and MFCC semantic ensemble
+  masking.py        psychoacoustic masking model
+  modeling.py       VITS model adapter
+  evaluation.py     ASR, audio quality, speaker, TTS, and robustness evaluation
+  utils.py          runtime, device, CSV, and JSON helpers
+scripts/
+  protect.py        single-file and manifest protection
+  evaluate.py       ASR, TTS, speaker, and robustness evaluation
+  prepare.py        model, dataset, and listening-test preparation
+  synthesize.py     paired-seed XTTS-v2 generation
+tts_models/          vendored model components required by the core
 ```
 
-- `Lfea`: E2E-VGuard timbre feature loss from VITS, GPT-SoVITS, MFCC, WavLM, CosyVoice CAM++, and StyleTTS2.
-- `Lsem`: T-SemAttack semantic representation loss from S3 Tokenizer, HuBERT-Large, Whisper-Large-v3, and MFCC.
-- `Lpsy`: psychoacoustic masking loss.
-- `L2`: perturbation norm.
-
-## Checkpoints
-
-Run:
+The previous top-level entrypoints were merged into these four scripts. Run all
+commands from this directory, for example:
 
 ```bash
-python download_models.py
+cd /home/ljh/ciscn/code/src
+python -m scripts.protect --help
 ```
 
-Then manually place VITS at:
+## Recommended Pipeline
 
-```text
-checkpoints/VITS/pretrained_ljs.pth
-```
+The current main result is `lq25_large_balanced`: 100 optimization steps,
+HuBERT-large, Whisper-large-v3, a `4/255` bound, and a 25 dB SNR constraint.
+It is the default batch preset and reproduces the configuration recorded in
+`outputs/06_large_balanced_20260804/full50/commands/`.
 
-The semantic tokenizer defaults to:
-
-```text
-checkpoints/CosyVoice/speech_tokenizer_v1.onnx
-```
-
-No new model training is required. The method reuses mature pretrained encoders as differentiable surrogate models.
-
-## Small LibriTTS Evaluation
-
-Full LibriTTS is large. For reproducible downstream evidence, fetch a small
-known-transcript subset first:
+Protect a manifest:
 
 ```bash
-python fetch_libritts_subset.py \
-  --split dev.clean \
-  --max_items 5 \
-  --output_dir data/libritts_devclean_small
-```
-
-Run semantic protection for the subset:
-
-```bash
-python run_semantic_batch.py \
-  --manifest data/libritts_devclean_small/manifest.csv \
-  --output_dir outputs/libritts_devclean_small \
-  --epochs 20 \
+python -m scripts.protect batch \
+  --manifest /home/ljh/ciscn/data/full50_hf_20260619_143424/manifest.csv \
+  --quality_preset lq25_large_balanced \
   --device cuda \
-  -- --no_vits --no_style
+  --output_dir /home/ljh/ciscn/outputs/full50_lq25_large_balanced
 ```
 
-Evaluate ASR against the real LibriTTS transcript:
+The historical `q18_perceptual` and `q24_perceptual` presets remain available
+for comparison. Arguments after `--` override preset values.
+
+Protect one audio file with explicit settings:
 
 ```bash
-python evaluate_asr.py manifest \
-  --manifest outputs/libritts_devclean_small/protected_e20.csv \
-  --asr_models openai-whisper:tiny.en \
-  --device cuda \
-  --output_dir outputs/eval_devclean_small_openai_whisper_tiny
-```
-
-Generate XTTS-v2 samples from clean and protected speaker references:
-
-```bash
-python generate_tts_xtts.py \
-  --references outputs/libritts_devclean_small/protected_e20.csv \
-  --target_text "This is a controlled downstream text to speech evaluation." \
-  --output_dir outputs/tts_xtts_devclean_small \
-  --limit 2 \
+python -m scripts.protect single \
+  --input_wav path/to/input.wav \
+  --output_wav path/to/protected.wav \
+  --epochs 100 \
   --device cuda
 ```
 
-Evaluate post-TTS ASR and speaker similarity:
+Evaluate direct ASR degradation and objective audio quality:
 
 ```bash
-python evaluate_tts.py \
-  --manifest outputs/tts_xtts_devclean_small/tts_manifest.csv \
-  --similarity_reference_manifest outputs/libritts_devclean_small/protected_e20.csv \
-  --similarity_reference_mode original_clean \
-  --asr_models openai-whisper:tiny.en \
-  --speaker_metric ecapa \
-  --speaker_model speechbrain/spkrec-ecapa-voxceleb \
+python -m scripts.evaluate asr \
+  --manifest /home/ljh/ciscn/outputs/full50_lq25_large_balanced/protected_lq25_large_balanced.csv \
+  --asr_models openai-whisper:medium,facebook/wav2vec2-base-960h \
   --device cuda \
-  --output_dir outputs/eval_tts_xtts_devclean_small
+  --output_dir /home/ljh/ciscn/outputs/full50_lq25_large_balanced/asr_eval
 ```
 
-## Mirrors
-
-Prefer domestic package mirrors and the Hugging Face mirror:
-
-```powershell
-$env:HF_ENDPOINT = "https://hf-mirror.com"
-uv pip install --python .\.venv\Scripts\python.exe `
-  --index-url https://pypi.tuna.tsinghua.edu.cn/simple `
-  -r requirements.txt
-```
-
-XTTS-v2 is optional. In the current Windows environment it was installed without
-letting Coqui downgrade the existing numeric stack:
-
-```powershell
-uv pip install --python .\.venv\Scripts\python.exe `
-  --index-url https://pypi.tuna.tsinghua.edu.cn/simple `
-  TTS==0.22.0 --no-deps
-
-uv pip install --python .\.venv\Scripts\python.exe `
-  --index-url https://pypi.tuna.tsinghua.edu.cn/simple `
-  coqpit trainer encodec anyascii num2words pysbd gruut gruut-ipa `
-  gruut-lang-en matplotlib bangla bnnumerizer bnunicodenormalizer `
-  hangul-romanize g2pkk dateparser tzlocal jsonlines python-crfsuite `
-  spacy==3.7.5
-```
-
-On Linux/pro, use the same packages with shell syntax:
+Generate paired-seed XTTS-v2 samples:
 
 ```bash
+python -m scripts.synthesize \
+  --references /home/ljh/ciscn/outputs/full50_lq25_large_balanced/protected_lq25_large_balanced.csv \
+  --target_text "This is a controlled downstream text to speech evaluation." \
+  --output_dir /home/ljh/ciscn/outputs/tts_lq25_large_balanced \
+  --device cuda
+```
+
+Evaluate post-TTS ASR and speaker similarity against original clean speakers:
+
+```bash
+python -m scripts.evaluate tts \
+  --manifest /home/ljh/ciscn/outputs/tts_lq25_large_balanced/tts_manifest.csv \
+  --asr_models openai-whisper:medium,facebook/wav2vec2-base-960h \
+  --speaker_metric ecapa \
+  --device cuda \
+  --output_dir /home/ljh/ciscn/outputs/tts_lq25_large_balanced/eval
+```
+
+## Supporting Commands
+
+Download required weights:
+
+```bash
+python -m scripts.prepare models
+```
+
+Fetch a small known-transcript LibriTTS subset:
+
+```bash
+python -m scripts.prepare dataset \
+  --split dev.clean \
+  --max_items 5 \
+  --output_dir /home/ljh/ciscn/data/libritts_devclean_small
+```
+
+Create robustness transforms and evaluate them:
+
+```bash
+python -m scripts.evaluate robustness \
+  --manifest /home/ljh/ciscn/outputs/full50_lq25_large_balanced/protected_lq25_large_balanced.csv \
+  --source_condition lq25_large_balanced \
+  --output_dir /home/ljh/ciscn/outputs/robustness
+
+python -m scripts.evaluate asr \
+  --manifest /home/ljh/ciscn/outputs/robustness/robust_manifest.csv \
+  --asr_models openai-whisper:medium,facebook/wav2vec2-base-960h \
+  --device cuda \
+  --output_dir /home/ljh/ciscn/outputs/robustness/asr_eval
+```
+
+Create a blinded listening set:
+
+```bash
+python -m scripts.prepare listening \
+  --manifest outputs/conditions.csv \
+  --conditions clean q18_perceptual q24_perceptual lq25_large_balanced \
+  --sample_count 20 \
+  --output_dir outputs/listening_test
+```
+
+See `outputs/README.md` for the result index. Existing CSV, JSON, manifest, and
+audio evidence is intentionally independent of this source layout refactor.
+
+## Environment
+
+The remote environment uses `/home/ljh/ciscn/.venv/bin/python`. Prefer the
+configured Hugging Face and PyPI mirrors:
+
+```bash
+cd /home/ljh/ciscn
 export HF_ENDPOINT=https://hf-mirror.com
 export UV_HTTP_TIMEOUT=120
-uv pip install --python /home/ljh/ciscn/.venv/bin/python \
+uv pip install --python .venv/bin/python \
   --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-  TTS==0.22.0 --no-deps
-
-uv pip install --python /home/ljh/ciscn/.venv/bin/python \
-  --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-  coqpit trainer encodec anyascii num2words pysbd gruut gruut-ipa \
-  gruut-lang-en matplotlib bangla bnnumerizer bnunicodenormalizer \
-  hangul-romanize g2pkk dateparser tzlocal jsonlines python-crfsuite \
-  spacy==3.7.5
+  -r code/src/requirements.txt
 ```
+
+XTTS-v2 is optional and still uses the environment adaptation in
+`scripts/synthesize.py`.
